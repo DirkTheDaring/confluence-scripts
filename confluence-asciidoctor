@@ -583,14 +583,14 @@ class Confluence:
         return lookup
 
     @staticmethod
-    def _extract_id_or_title_from_url(value: str) -> Tuple[Optional[str], Optional[str]]:
+    def _extract_id_or_title_from_url(value: str) -> tuple[Optional[str], Optional[str]]:
         """Return (page_id, title_from_url) for a Confluence page URL.
         Supports paths like /spaces/<KEY>/pages/<ID>/<Title> and /pages/<ID>/...
         """
         try:
             u = urlparse(value)
             path = u.path
-            m = re.search(r"/pages/(\\d+)", path)
+            m = re.search(r"/pages/(\d+)", path)
             if m:
                 return m.group(1), None
             # Fallback: decode trailing path segment into a title
@@ -649,16 +649,17 @@ class Confluence:
         root_dir = Path(self.config["internal"]["root_dir"])  # type: ignore[index]
         relpath = Path("") if abspath == root_dir else abspath.relative_to(root_dir)
 
-        # Determine ancestor_id: accept URL or plain title for
-        # -p/--parent-page-title
+        # Determine ancestor_id: accept URL or plain title for -p/--parent-page-title
         ancestor_id: Optional[str] = None
         if parent_page_title:
-            if parent_page_title.startswith("http://") or parent_page_title.startswith("https://"):
+            if parent_page_title.startswith(("http://", "https://")):
                 page_id, trailing_title = self._extract_id_or_title_from_url(parent_page_title)
                 if page_id:
                     ancestor_id = page_id
                 elif trailing_title:
                     ancestor_id = self._cached_ancestor_id(trailing_title)
+                else:
+                    raise RuntimeError(f"Could not extract parent pageId/title from URL: {parent_page_title}")
             else:
                 ancestor_id = self._cached_ancestor_id(parent_page_title)
         elif relpath != Path(""):
@@ -675,15 +676,13 @@ class Confluence:
 
         result = self.publish(title, xhtml, ancestor_id)
         page_id = result["id"]
-
         for img in image_src_list:
             log.info("  Appending image '%s'", img)
             self.c.attach_file_to_page(page_id, Path(img), "initial")
 
     def dump(self, page_name_or_url: str) -> None:
-        # Accept a page title OR a full URL. Prefer numeric pageId when
-        # present.
-        if page_name_or_url.startswith("http://") or page_name_or_url.startswith("https://"):
+        # If a URL is provided, try to use pageId. Do NOT fall back silently.
+        if page_name_or_url.startswith(("http://", "https://")):
             page_id, trailing_title = self._extract_id_or_title_from_url(page_name_or_url)
             if page_id:
                 result = self.c.dump(page_id)
@@ -691,13 +690,20 @@ class Confluence:
                 print(body)
                 return
             if trailing_title:
+                # URL without numeric id: try by title in current space
                 page_name_or_url = trailing_title
-        # Fallback: title lookup in current space
+            else:
+                raise RuntimeError(f"Could not extract pageId or title from URL: {page_name_or_url}")
+
+        # Title lookup in current space
         json_data = self.c.version(page_name_or_url)
         ancestor_id = self._get_element_by_path("results[0].id", json_data)
+        if not ancestor_id:
+            raise RuntimeError(f"Page not found by title in space '{self.c.space_key}': {page_name_or_url}")
         result = self.c.dump(ancestor_id)
         body = self._get_element_by_path("body.storage.value", result)
         print(body)
+
 
     def dump_xhtml(self, filename: Path) -> None:
         xhtml = self.read_from_asciidoctor(filename)
