@@ -6,6 +6,8 @@ Confluence Asciidoctor Publisher (Python 3 only)
 - Paths via pathlib, structured logging, exceptions (no sys.exit in lib code)
 - Skips directory args; accepts any 2xx HTTP; proxy env support
 - Clean CLI: --help does not touch FS; fast-path init avoids crawling
+- dump/download accept title or full URL (prefer pageId if present)
+- publish supports --url to target an existing page by URL (prefer pageId)
 """
 from __future__ import annotations
 
@@ -126,23 +128,16 @@ class ConfluenceRestAPI:
     def PUT_JSON(self, url: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
         return self._to_json(self.http.PUT(url, json.dumps(payload)))
 
-    def ancestors(self, title: str) -> Dict[str, Any]:
-        url = self._build_url({"spaceKey": self.space_key, "expand": "ancestors", "title": title})
-        return self.GET_JSON(url)
-
-    def version(self, title: str) -> Dict[str, Any]:
+    def search_by_title_version(self, title: str) -> Dict[str, Any]:
         url = self._build_url({"spaceKey": self.space_key, "expand": "version", "title": title})
         return self.GET_JSON(url)
 
-    def dump(self, page_id: str) -> Dict[str, Any]:
-        url = f"{self.base_url}/rest/api/content/{page_id}?expand=body.storage"
+    def get_content(self, page_id: str, expand: str = "version,body.storage,title,ancestors") -> Dict[str, Any]:
+        url = f"{self.base_url}/rest/api/content/{page_id}?expand={expand}"
         return self.GET_JSON(url)
 
-    @staticmethod
-    def _merge(a: Mapping[str, Any], b: Mapping[str, Any]) -> Dict[str, Any]:
-        merged = dict(a)
-        merged.update(b)
-        return merged
+    def dump_body(self, page_id: str) -> Dict[str, Any]:
+        return self.get_content(page_id, expand="body.storage")
 
     def create_page(self, title: str, xhtml: str, ancestor_id: Optional[str] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -152,11 +147,11 @@ class ConfluenceRestAPI:
             "body": {"storage": {"value": xhtml, "representation": "storage"}},
         }
         if ancestor_id:
-            payload = self._merge(payload, {"ancestors": [{"type": "page", "id": ancestor_id}]})
+            payload["ancestors"] = [{"type": "page", "id": ancestor_id}]
         url = f"{self.base_url}/rest/api/content/"
         return self.POST_JSON(url, payload)
 
-    def update_page(
+    def update_page_by_id(
         self,
         page_id: str,
         version: int,
@@ -173,7 +168,7 @@ class ConfluenceRestAPI:
             "version": {"number": version},
         }
         if ancestor_id:
-            payload = self._merge(payload, {"ancestors": [{"type": "page", "id": ancestor_id}]})
+            payload["ancestors"] = [{"type": "page", "id": ancestor_id}]
         url = f"{self.base_url}/rest/api/content/{page_id}"
         return self.PUT_JSON(url, payload)
 
@@ -207,7 +202,6 @@ class ConfluenceRestAPI:
 class ConfluenceFixes:
     def __init__(self, config: Mapping[str, Mapping[str, str]]):
         self.image_src_list: List[str] = []
-        self.a_href_list: List[str] = []
         self.namespaces = {
             "xhtml": "http://www.w3.org/1999/xhtml",
             "ac": "http://www.atlassian.com/schema/confluence/4/ac/",
@@ -376,15 +370,6 @@ class ConfluenceFixes:
         paths = dom.xpath("/xhtml:html/xhtml:body//xhtml:img/@src", namespaces=self.namespaces)
         self.image_src_list = [unquote(s) for s in paths]
 
-    def _extract_a_sources(self, dom: ET._Element) -> None:
-        self.a_href_list = dom.xpath("/xhtml:html/xhtml:body//xhtml:a/@href", namespaces=self.namespaces)
-
-    def get_image_src_list(self) -> List[str]:
-        return self.image_src_list
-
-    def get_a_href_list(self) -> List[str]:
-        return self.a_href_list
-
     def process_asciidoctor_dom(self, dom: ET._Element) -> str:
         self._extract_img_sources(dom)
         self._replace_imgs_with_attachments(dom)
@@ -473,10 +458,12 @@ class SimpleConfiguration:
 
     @staticmethod
     def _find_root(dirpath: Path, config_dir: str) -> Optional[Path]:
-        while dirpath != dirpath.root:
+        while True:
             target = dirpath / config_dir
             if target.is_dir():
                 return target
+            if dirpath.parent == dirpath:
+                break
             dirpath = dirpath.parent
         return None
 
@@ -484,7 +471,7 @@ class SimpleConfiguration:
 def get_internal_default_config() -> Dict[str, Dict[str, str]]:
     return {
         "default": {
-            "base_url": "https://example.com/space",
+            "base_url": "https://example.com",
             "space_key": "EXA",
             "code_theme": "Confluence",
         }
@@ -512,7 +499,7 @@ class ShellCmd:
         proc = subprocess.run(args, capture_output=True, text=True)
         self.exit_code = proc.returncode
         if proc.returncode != 0:
-            raise RuntimeError(f"Command failed: {' '.join(args)} {proc.stderr}")
+            raise RuntimeError(f"Command failed: {' '.join(args)}\n{proc.stderr}")
         return proc.stdout
 
 
@@ -530,6 +517,7 @@ class Confluence:
         self.c = ConfluenceRestAPI(self.http, base_url, space_key)
         self._ancestor_cache: Dict[str, Optional[str]] = {}
 
+    # ---- helpers ------------------------------------------------------------
     @staticmethod
     def filename_to_title(name: Path) -> str:
         return name.stem or name.name
@@ -572,7 +560,7 @@ class Confluence:
         for element in self._parse_path(path):
             if element.isdigit():
                 pos = int(element)
-                if pos >= len(lookup):
+                if not isinstance(lookup, list) or pos >= len(lookup):
                     return None
                 lookup = lookup[pos]
             else:
@@ -583,7 +571,7 @@ class Confluence:
         return lookup
 
     @staticmethod
-    def _extract_id_or_title_from_url(value: str) -> tuple[Optional[str], Optional[str]]:
+    def _extract_id_or_title_from_url(value: str) -> Tuple[Optional[str], Optional[str]]:
         """Return (page_id, title_from_url) for a Confluence page URL.
         Supports paths like /spaces/<KEY>/pages/<ID>/<Title> and /pages/<ID>/...
         """
@@ -600,14 +588,9 @@ class Confluence:
         except Exception:
             return None, None
 
-    @staticmethod
-    def read_from_asciidoctor(filename: Path) -> str:
-        cmd = ShellCmd()
-        args = ["asciidoctor", "-b", "xhtml5", "-o", "-", str(filename)]
-        return cmd.execute(args)
-
+    # ---- REST lookups ------------------------------------------------------
     def _ancestor_id(self, title: str) -> Optional[str]:
-        json_data = self.c.version(title)
+        json_data = self.c.search_by_title_version(title)
         return self._get_element_by_path("results[0].id", json_data)
 
     def _cached_ancestor_id(self, title: Optional[str]) -> Optional[str]:
@@ -619,13 +602,23 @@ class Confluence:
         self._ancestor_cache[title] = ancestor_id
         return ancestor_id
 
-    def publish(self, title: str, content: str, ancestor_id: Optional[str]) -> Dict[str, Any]:
-        json_result = self.c.version(title)
+    # ---- core ops ----------------------------------------------------------
+    def publish_by_title(self, title: str, content: str, ancestor_id: Optional[str]) -> Dict[str, Any]:
+        json_result = self.c.search_by_title_version(title)
         if not json_result.get("results"):
             return self.c.create_page(title, content, ancestor_id)
         page_id = self._get_element_by_path("results[0].id", json_result)
-        version = self._get_element_by_path("results[0].version.number", json_result) or 0
-        return self.c.update_page(page_id, int(version) + 1, title, content, ancestor_id)
+        version = int(self._get_element_by_path("results[0].version.number", json_result) or 0) + 1
+        return self.c.update_page_by_id(page_id, version, title, content, ancestor_id)
+
+    def publish_by_id(self, page_id: str, content: str, ancestor_id: Optional[str]) -> Dict[str, Any]:
+        # Fetch current to get version+title
+        doc = self.c.get_content(page_id, expand="version,title")
+        title = self._get_element_by_path("title", doc)
+        version = int(self._get_element_by_path("version.number", doc) or 0) + 1
+        if not title:
+            raise RuntimeError(f"Could not read title for page id {page_id}")
+        return self.c.update_page_by_id(page_id, version, title, content, ancestor_id)
 
     def _file_to_xml(self, filename: Path) -> Tuple[str, List[str]]:
         fix = ConfluenceFixes(self.config)
@@ -637,73 +630,89 @@ class Confluence:
             xhtml = fix.process_asciidoctor_xml(xhtml)
         else:
             raise ValueError(f"Unsupported file type: {filename.suffix}")
-        return xhtml, fix.get_image_src_list()
+        return xhtml, fix.image_src_list
 
-    def process_file(self, filename: Path, parent_page_title: Optional[str] = None) -> None:
+    @staticmethod
+    def read_from_asciidoctor(filename: Path) -> str:
+        cmd = ShellCmd()
+        args = ["asciidoctor", "-b", "xhtml5", "-o", "-", str(filename)]
+        return cmd.execute(args)
+
+    # ---- entrypoints -------------------------------------------------------
+    def process_file(
+        self,
+        filename: Path,
+        parent_page_title: Optional[str] = None,
+        url_override: Optional[str] = None,
+    ) -> None:
         if filename.is_dir():
             log.info("Skipping directory argument: %s", filename)
             return
 
-        title = self.filename_to_title(filename)
-        abspath = filename.resolve().parent
-        root_dir = Path(self.config["internal"]["root_dir"])  # type: ignore[index]
-        relpath = Path("") if abspath == root_dir else abspath.relative_to(root_dir)
+        # Resolve target page by --url (preferred) or by filename-derived title
+        target_page_id: Optional[str] = None
+        target_title: Optional[str] = None
+        if url_override and url_override.startswith(("http://", "https://")):
+            page_id, trailing_title = self._extract_id_or_title_from_url(url_override)
+            if page_id:
+                target_page_id = page_id
+            elif trailing_title:
+                target_title = trailing_title
+        if not target_page_id and not target_title:
+            target_title = self.filename_to_title(filename)
 
-        # Determine ancestor_id: accept URL or plain title for -p/--parent-page-title
+        # Resolve ancestor id (parent) - accepts URL or title
         ancestor_id: Optional[str] = None
         if parent_page_title:
             if parent_page_title.startswith(("http://", "https://")):
-                page_id, trailing_title = self._extract_id_or_title_from_url(parent_page_title)
-                if page_id:
-                    ancestor_id = page_id
-                elif trailing_title:
-                    ancestor_id = self._cached_ancestor_id(trailing_title)
-                else:
-                    raise RuntimeError(f"Could not extract parent pageId/title from URL: {parent_page_title}")
+                pid, trailing = self._extract_id_or_title_from_url(parent_page_title)
+                if pid:
+                    ancestor_id = pid
+                elif trailing:
+                    ancestor_id = self._cached_ancestor_id(trailing)
             else:
                 ancestor_id = self._cached_ancestor_id(parent_page_title)
-        elif relpath != Path(""):
-            derived_parent = os.path.basename(self.relpath_to_lookup_name(relpath))
-            ancestor_id = self._cached_ancestor_id(derived_parent)
 
         xhtml, image_src_list = self._file_to_xml(filename)
-        msg = f"Publishing '{title}' to '{self.hostname}'"
-        if ancestor_id:
-            msg += f" under parent page-id '{ancestor_id}'"
-        elif parent_page_title:
-            msg += f" under parent title '{parent_page_title}'"
-        log.info(msg)
 
-        result = self.publish(title, xhtml, ancestor_id)
+        if target_page_id:
+            log.info("Updating page by ID %s on '%s'%s",
+                     target_page_id, self.hostname,
+                     f" under parent id '{ancestor_id}'" if ancestor_id else "")
+            result = self.publish_by_id(target_page_id, xhtml, ancestor_id)
+        else:
+            assert target_title
+            log.info("Publishing '%s' on '%s'%s",
+                     target_title, self.hostname,
+                     f" under parent id '{ancestor_id}'" if ancestor_id else "")
+            result = self.publish_by_title(target_title, xhtml, ancestor_id)
+
         page_id = result["id"]
         for img in image_src_list:
             log.info("  Appending image '%s'", img)
             self.c.attach_file_to_page(page_id, Path(img), "initial")
 
     def dump(self, page_name_or_url: str) -> None:
-        # If a URL is provided, try to use pageId. Do NOT fall back silently.
+        # Accept a page title OR a full URL. Prefer numeric pageId when present.
         if page_name_or_url.startswith(("http://", "https://")):
             page_id, trailing_title = self._extract_id_or_title_from_url(page_name_or_url)
             if page_id:
-                result = self.c.dump(page_id)
+                result = self.c.dump_body(page_id)
                 body = self._get_element_by_path("body.storage.value", result)
                 print(body)
                 return
             if trailing_title:
-                # URL without numeric id: try by title in current space
                 page_name_or_url = trailing_title
             else:
                 raise RuntimeError(f"Could not extract pageId or title from URL: {page_name_or_url}")
-
-        # Title lookup in current space
-        json_data = self.c.version(page_name_or_url)
-        ancestor_id = self._get_element_by_path("results[0].id", json_data)
-        if not ancestor_id:
+        # Fallback: title lookup in current space
+        json_data = self.c.search_by_title_version(page_name_or_url)
+        page_id = self._get_element_by_path("results[0].id", json_data)
+        if not page_id:
             raise RuntimeError(f"Page not found by title in space '{self.c.space_key}': {page_name_or_url}")
-        result = self.c.dump(ancestor_id)
+        result = self.c.dump_body(page_id)
         body = self._get_element_by_path("body.storage.value", result)
         print(body)
-
 
     def dump_xhtml(self, filename: Path) -> None:
         xhtml = self.read_from_asciidoctor(filename)
@@ -717,19 +726,19 @@ class Confluence:
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
-
 def parse_cmdline() -> argparse.Namespace:
     parser = argparse.ArgumentParser("confluence-asciidoctor")
 
     parser.add_argument("--code-theme", dest="code_theme", help="Confluence code macro theme")
     parser.add_argument("--token", dest="token", help="Bearer token (or set CONFLUENCE_TOKEN)")
 
-    # Do not require subcommand so --help works without FS access
     subparsers = parser.add_subparsers(dest="command", help="commands")
 
     p_pub = subparsers.add_parser("publish", aliases=["pu"], help="Publish one or more files")
     p_pub.add_argument("-p", "--parent-page-title", dest="parent_page_title",
-                   help="Parent page: title OR full URL")
+                       help="Parent page: title OR full URL")
+    p_pub.add_argument("--url", dest="url_override",
+                       help="Target page URL (id or title will be derived)")
     p_pub.add_argument("file", nargs="+", help=".txt (asciidoctor) or .xml files")
 
     p_dl = subparsers.add_parser("download", aliases=["do"], help="Dump page content")
@@ -742,7 +751,8 @@ def parse_cmdline() -> argparse.Namespace:
     p_dumpx.add_argument("file", help=".txt file path")
 
     p_init = subparsers.add_parser("init", help="Initialize local config directory")
-    p_init.add_argument("--url", default="http://127.0.0.1/display/EXAMPLE", help="Confluence space URL (…/display/<SPACE>)")
+    p_init.add_argument("--url", default="http://127.0.0.1/display/EXAMPLE",
+                        help="Confluence space URL (…/display/<SPACE>)")
 
     args = parser.parse_args()
 
@@ -818,7 +828,7 @@ def main() -> None:
         return
     if args.command == "publish":
         for fname in args.file:
-            confluence.process_file(Path(fname), args.parent_page_title)
+            confluence.process_file(Path(fname), args.parent_page_title, args.url_override)
         return
 
 
