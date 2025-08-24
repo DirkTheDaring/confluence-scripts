@@ -1,0 +1,843 @@
+#!/usr/bin/env python3
+"""
+Refactored Confluence Asciidoctor publisher (Python 3 only)
+- Removes netrc/Basic Auth; adds Bearer token auth (CLI or env)
+- Adds type hints, logging, and structured errors
+- Uses pathlib for paths and f-strings
+- Skips directories passed as inputs
+- Handles redirects and accepts any 2xx status code
+- Avoids sys.exit() in library code; raises exceptions instead
+
+Auth:
+  * Pass --token "<token>" or set environment variable CONFLUENCE_TOKEN
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+import lxml.etree as ET
+import urllib3
+from configparser import ConfigParser, ExtendedInterpolation
+from urllib.parse import urlencode, urlparse, unquote
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("confluence-asciidoctor")
+
+# -----------------------------------------------------------------------------
+# HTTP
+# -----------------------------------------------------------------------------
+class HTTPError(RuntimeError):
+    pass
+
+
+class HTTP:
+    """Thin wrapper around urllib3 with Bearer auth and proxy support."""
+
+    def __init__(self, bearer_token: str | None) -> None:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        proxy_url = self._get_proxy_url()
+        self.http = urllib3.ProxyManager(proxy_url) if proxy_url else urllib3.PoolManager()
+        self.bearer_token = bearer_token
+        self.base_headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if bearer_token:
+            self.base_headers["Authorization"] = f"Bearer {bearer_token}"
+
+    @staticmethod
+    def _get_proxy_url() -> Optional[str]:
+        for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+            value = os.environ.get(name)
+            if value:
+                return value
+        return None
+
+    def _merge_headers(self, headers: Optional[Mapping[str, str]]) -> Mapping[str, str]:
+        merged: Dict[str, str] = dict(self.base_headers)
+        if headers:
+            merged.update(headers)
+        return merged
+
+    @staticmethod
+    def _handle_response(response: urllib3.response.HTTPResponse) -> str:
+        if not (200 <= response.status < 300):
+            raise HTTPError(f"Unexpected status code: {response.status}")
+        return response.data.decode("utf-8", "strict")
+
+    def GET(self, url: str, headers: Optional[Mapping[str, str]] = None) -> str:
+        resp = self.http.request("GET", url, headers=self._merge_headers(headers))
+        return self._handle_response(resp)
+
+    def POST(self, url: str, data: str, headers: Optional[Mapping[str, str]] = None) -> str:
+        resp = self.http.request("POST", url, headers=self._merge_headers(headers), body=data)
+        return self._handle_response(resp)
+
+    def PUT(self, url: str, data: str, headers: Optional[Mapping[str, str]] = None) -> str:
+        resp = self.http.request("PUT", url, headers=self._merge_headers(headers), body=data)
+        return self._handle_response(resp)
+
+    def POST_MULTIPART(
+        self,
+        url: str,
+        headers: Optional[Mapping[str, str]],
+        fields: Mapping[str, Any],
+    ) -> str:
+        resp = self.http.request("POST", url, headers=self._merge_headers(headers), fields=fields)
+        return self._handle_response(resp)
+
+    def POST_FILE(
+        self,
+        url: str,
+        headers: Optional[Mapping[str, str]],
+        fields: Dict[str, Any],
+        filepath: Path,
+        field_name: str,
+        filename: Optional[str] = None,
+    ) -> str:
+        if filename is None:
+            filename = filepath.name
+        data = filepath.read_bytes()
+        file_tuple = (filename, data)
+        fields = dict(fields)
+        fields[field_name] = file_tuple
+        return self.POST_MULTIPART(url, headers=headers, fields=fields)
+
+
+# -----------------------------------------------------------------------------
+# Confluence REST
+# -----------------------------------------------------------------------------
+class ConfluenceRestAPI:
+    def __init__(self, http: HTTP, base_url: str, space_key: str) -> None:
+        self.http = http
+        self.base_url = base_url.rstrip("/")
+        self.space_key = space_key
+
+    def _build_url(self, params: Mapping[str, str]) -> str:
+        return f"{self.base_url}/rest/api/content?{urlencode(params)}"
+
+    @staticmethod
+    def _to_json(result: Optional[str]) -> Dict[str, Any]:
+        return {} if result is None else json.loads(result)
+
+    def GET_JSON(self, url: str) -> Dict[str, Any]:
+        return self._to_json(self.http.GET(url))
+
+    def POST_JSON(self, url: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        return self._to_json(self.http.POST(url, json.dumps(payload)))
+
+    def PUT_JSON(self, url: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        return self._to_json(self.http.PUT(url, json.dumps(payload)))
+
+    def ancestors(self, title: str) -> Dict[str, Any]:
+        url = self._build_url({"spaceKey": self.space_key, "expand": "ancestors", "title": title})
+        return self.GET_JSON(url)
+
+    def version(self, title: str) -> Dict[str, Any]:
+        url = self._build_url({"spaceKey": self.space_key, "expand": "version", "title": title})
+        return self.GET_JSON(url)
+
+    def dump(self, page_id: str) -> Dict[str, Any]:
+        url = f"{self.base_url}/rest/api/content/{page_id}?expand=body.storage"
+        return self.GET_JSON(url)
+
+    @staticmethod
+    def _merge(a: Mapping[str, Any], b: Mapping[str, Any]) -> Dict[str, Any]:
+        merged = dict(a)
+        merged.update(b)
+        return merged
+
+    def create_page(self, title: str, xhtml: str, ancestor_id: Optional[str] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "type": "page",
+            "title": title,
+            "space": {"key": self.space_key},
+            "body": {"storage": {"value": xhtml, "representation": "storage"}},
+        }
+        if ancestor_id:
+            payload = self._merge(payload, {"ancestors": [{"type": "page", "id": ancestor_id}]})
+        url = f"{self.base_url}/rest/api/content/"
+        return self.POST_JSON(url, payload)
+
+    def update_page(
+        self,
+        page_id: str,
+        version: int,
+        title: str,
+        value: str,
+        ancestor_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "id": page_id,
+            "type": "page",
+            "title": title,
+            "space": {"key": self.space_key},
+            "body": {"storage": {"value": value, "representation": "storage"}},
+            "version": {"number": version},
+        }
+        if ancestor_id:
+            payload = self._merge(payload, {"ancestors": [{"type": "page", "id": ancestor_id}]})
+        url = f"{self.base_url}/rest/api/content/{page_id}"
+        return self.PUT_JSON(url, payload)
+
+    def list_attachments(self, page_id: str) -> Dict[str, Any]:
+        url = f"{self.base_url}/rest/api/content/{page_id}/child/attachment"
+        return self.GET_JSON(url)
+
+    def attach_file(self, page_id: str, filename: Path, comment: str = "") -> Dict[str, Any]:
+        url = f"{self.base_url}/rest/api/content/{page_id}/child/attachment"
+        headers = {"X-Atlassian-Token": "nocheck"}
+        fields = {"comment": comment}
+        result = self.http.POST_FILE(url, headers, fields, filename, "file")
+        return self._to_json(result)
+
+    def attach_file_to_page(self, page_id: str, filepath: Path, comment: str = "") -> Optional[Dict[str, Any]]:
+        if not filepath.exists():
+            log.warning("Attachment file does not exist: %s", filepath)
+            return None
+        json_result = self.list_attachments(page_id)
+        for res in json_result.get("results", []):
+            if filepath.name == res.get("title"):
+                log.info("Attachment already exists (skipped): %s", filepath.name)
+                return None
+        log.info("Uploading attachment: %s", filepath)
+        return self.attach_file(page_id, filepath, comment)
+
+
+# -----------------------------------------------------------------------------
+# Confluence XHTML/XSLT fixes (unchanged from previous refactor)
+# -----------------------------------------------------------------------------
+class ConfluenceFixes:
+    def __init__(self, config: Mapping[str, Mapping[str, str]]):
+        self.image_src_list: List[str] = []
+        self.a_href_list: List[str] = []
+        self.namespaces = {
+            "xhtml": "http://www.w3.org/1999/xhtml",
+            "ac": "http://www.atlassian.com/schema/confluence/4/ac/",
+            "ri": "http://www.atlassian.com/schema/confluence/4/ri/",
+        }
+        self.config = config
+
+    @staticmethod
+    def extract_content_div_xsl() -> str:
+        return '''<xsl:stylesheet
+            version="1.0"
+            xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+            xmlns:x="http://www.w3.org/1999/xhtml"
+            xmlns:ac="http://www.atlassian.com/schema/confluence/4/ac/"
+            xmlns:ri="http://www.atlassian.com/schema/confluence/4/ri/"
+            exclude-result-prefixes="x"
+            >
+            <xsl:output indent="yes" method="xml" omit-xml-declaration="yes"  />
+            <xsl:template match="/">
+                    <div>
+                    <xsl:apply-templates select="x:html/x:body/x:div[@id='content']/x:*"/>
+                    </div>
+            </xsl:template>
+            <xsl:template match="@*|node()">
+            <xsl:copy>
+                <xsl:apply-templates select="@*|node()"/>
+            </xsl:copy>
+            </xsl:template>
+            <xsl:template match="x:*">
+                    <xsl:element name="{local-name()}">
+                            <xsl:copy-of select="namespace::*[not(. = namespace-uri(..))]"/>
+                            <xsl:apply-templates select="@*|node()"/>
+                    </xsl:element>
+            </xsl:template>
+</xsl:stylesheet>
+'''
+
+    @staticmethod
+    def transform_code_section_xsl() -> str:
+        return '''
+<xsl:stylesheet
+            version="1.0"
+            xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+            xmlns:x="http://www.w3.org/1999/xhtml"
+            xmlns:ac="http://www.atlassian.com/schema/confluence/4/ac/"
+            xmlns:ri="http://www.atlassian.com/schema/confluence/4/ri/"
+            exclude-result-prefixes="x"
+            >
+            <xsl:output indent="yes" method="xml" omit-xml-declaration="yes"  cdata-section-elements="ac:plain-text-body"  />
+    <xsl:template match="node()|@*">
+        <xsl:copy>
+            <xsl:apply-templates select="node()|@*"/>
+            </xsl:copy>
+    </xsl:template>
+    <xsl:template match="//div[div[@class='content']/pre[@class='highlight'] ]" >
+        <ac:structured-macro ac:name="code" ac:schema-version="1" ac:macro-id="bcb394c5-e0b8-4630-9e1a-1c3a48076738">
+            <ac:parameter ac:name="language"><xsl:value-of select="div/pre/code/@data-lang" /></ac:parameter>
+            <ac:parameter ac:name="theme"><xsl:copy-of select="$theme"/></ac:parameter>
+            <ac:parameter ac:name="title"><xsl:copy-of select="$title"/></ac:parameter>
+            <ac:plain-text-body><xsl:value-of select="div/pre/code" /></ac:plain-text-body>
+        </ac:structured-macro>
+            </xsl:template>
+</xsl:stylesheet>
+'''
+
+    @staticmethod
+    def transform_table_xsl() -> str:
+        return '''
+<xsl:stylesheet
+            version="1.0"
+            xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+            xmlns:x="http://www.w3.org/1999/xhtml"
+            xmlns:ac="http://www.atlassian.com/schema/confluence/4/ac/"
+            exclude-result-prefixes="x"
+            >
+    <xsl:output indent="yes" method="xml" omit-xml-declaration="yes"  cdata-section-elements="ac:plain-text-body"  />
+    <xsl:template match="node()|@*">
+        <xsl:copy>
+            <xsl:apply-templates select="node()|@*"/>
+            </xsl:copy>
+    </xsl:template>
+    <xsl:template match="x:table">
+        <xsl:element name="table" namespace="http://www.w3.org/1999/xhtml"  >
+            <xsl:attribute name="class">fixed-table wrapped</xsl:attribute>
+        <xsl:element name="colgroup" namespace="http://www.w3.org/1999/xhtml" >
+            <xsl:copy-of select="./x:colgroup/x:col"/>
+        </xsl:element>
+        <xsl:element name="tbody" namespace="http://www.w3.org/1999/xhtml" >
+            <xsl:for-each select="./x:thead/x:tr">
+                <xsl:element name="tr" namespace="http://www.w3.org/1999/xhtml" >
+                    <xsl:for-each select="./x:th">
+                    <xsl:element name="th" namespace="http://www.w3.org/1999/xhtml" >
+                            <xsl:copy-of select="node()"/>
+                    </xsl:element>
+                    </xsl:for-each>
+                </xsl:element>
+            </xsl:for-each>
+            <xsl:for-each select="./x:tbody/x:tr">
+                <xsl:element name="tr" namespace="http://www.w3.org/1999/xhtml" >
+                    <xsl:for-each select="./x:td/x:p">
+                    <xsl:element name="td" namespace="http://www.w3.org/1999/xhtml" >
+                            <xsl:copy-of select="node()"/>
+                    </xsl:element>
+                    </xsl:for-each>
+                </xsl:element>
+            </xsl:for-each>
+        </xsl:element>
+        </xsl:element>
+    </xsl:template>
+</xsl:stylesheet>
+'''
+
+    def _transform(self, dom: ET._Element, xslt_text: str, **params: Any) -> ET._Element:
+        xslt = ET.XML(xslt_text)
+        transform = ET.XSLT(xslt)
+        newdom = transform(dom, **{k: ET.XSLT.strparam(v) for k, v in params.items()})
+        return newdom  # type: ignore[return-value]
+
+    def transform_table(self, dom: ET._Element) -> ET._Element:
+        return self._transform(dom, self.transform_table_xsl())
+
+    def transform_code_section(self, dom: ET._Element) -> ET._Element:
+        theme = self.config["default"]["code_theme"]
+        title = ""
+        newdom = self._transform(dom, self.transform_code_section_xsl(), theme=theme, title=title)
+        elements = newdom.xpath("//ac:parameter[@ac:name='language']", namespaces=self.namespaces)
+        for element in elements:
+            value = (element.text or "").lower()
+            if value in ("python", "python3"):
+                value = "py"
+            elif value == "yaml":
+                value = "yml"
+            element.text = value
+        return newdom
+
+    def extract_content(self, dom: ET._Element) -> ET._Element:
+        return self._transform(dom, self.extract_content_div_xsl())
+
+    def create_standard_attachment(self, filename: str) -> ET._Element:
+        new_ac_element = ET.Element("{http://www.atlassian.com/schema/confluence/4/ac/}image", nsmap=self.namespaces)
+        ET.SubElement(
+            new_ac_element,
+            "{http://www.atlassian.com/schema/confluence/4/ri/}attachment",
+            {"{http://www.atlassian.com/schema/confluence/4/ri/}filename": filename},
+            nsmap=self.namespaces,
+        )
+        return new_ac_element
+
+    def create_macro_attachment(self, filename: str, height: str = "250") -> ET._Element:
+        new_ac_element = ET.Element(
+            "{http://www.atlassian.com/schema/confluence/4/ac/}structured-macro",
+            {
+                "{http://www.atlassian.com/schema/confluence/4/ac/}name": "view-file",
+                "{http://www.atlassian.com/schema/confluence/4/ac/}schema-version": "1",
+            },
+            nsmap=self.namespaces,
+        )
+        param = ET.SubElement(
+            new_ac_element,
+            "{http://www.atlassian.com/schema/confluence/4/ac/}parameter",
+            {"{http://www.atlassian.com/schema/confluence/4/ac/}name": "name"},
+            nsmap=self.namespaces,
+        )
+        ET.SubElement(
+            param,
+            "{http://www.atlassian.com/schema/confluence/4/ri/}attachment",
+            {"{http://www.atlassian.com/schema/confluence/4/ri/}filename": filename},
+            nsmap=self.namespaces,
+        )
+        param2 = ET.SubElement(
+            new_ac_element,
+            "{http://www.atlassian.com/schema/confluence/4/ac/}parameter",
+            {"{http://www.atlassian.com/schema/confluence/4/ac/}name": "height"},
+            nsmap=self.namespaces,
+        )
+        param2.text = height
+        return new_ac_element
+
+    def _img_query(self, dom: ET._Element) -> List[ET._Element]:
+        return dom.xpath("/xhtml:html/xhtml:body//xhtml:img", namespaces=self.namespaces)
+
+    def _replace_imgs_with_attachments(self, dom: ET._Element) -> None:
+        for img in self._img_query(dom):
+            src = Path(unquote(os.path.basename(img.attrib.get("src", ""))))
+            parent = img.getparent()
+            if not parent:
+                continue
+            if src.suffix in {".pptx", ".pdf"}:
+                new_ac_element = self.create_macro_attachment(src.name)
+            else:
+                new_ac_element = self.create_standard_attachment(src.name)
+            parent.replace(img, new_ac_element)
+
+    def _extract_img_sources(self, dom: ET._Element) -> None:
+        image_src_list = dom.xpath("/xhtml:html/xhtml:body//xhtml:img/@src", namespaces=self.namespaces)
+        self.image_src_list = [unquote(s) for s in image_src_list]
+
+    def _extract_a_sources(self, dom: ET._Element) -> None:
+        self.a_href_list = dom.xpath("/xhtml:html/xhtml:body//xhtml:a/@href", namespaces=self.namespaces)
+
+    def get_image_src_list(self) -> List[str]:
+        return self.image_src_list
+
+    def get_a_href_list(self) -> List[str]:
+        return self.a_href_list
+
+    def process_asciidoctor_dom(self, dom: ET._Element) -> str:
+        self._extract_img_sources(dom)
+        self._replace_imgs_with_attachments(dom)
+        newdom1 = self.extract_content(dom)
+        newdom2 = self.transform_code_section(newdom1)
+        newdom3 = self.transform_table(newdom2)
+        return ET.tostring(newdom3, pretty_print=True, encoding="UTF-8").decode("utf-8")
+
+    def process_asciidoctor_xml(self, xhtml_text: str) -> str:
+        dom = ET.XML(xhtml_text)
+        return self.process_asciidoctor_dom(dom)
+
+    @staticmethod
+    def get_namespaces() -> str:
+        xmlns = {
+            "xhtml": "http://www.w3.org/1999/xhtml",
+            "ac": "http://www.atlassian.com/schema/confluence/4/ac/",
+            "ri": "http://www.atlassian.com/schema/confluence/4/ri/",
+        }
+        parts = [f"xmlns:{k}=\"{v}\"" for k, v in xmlns.items()]
+        return " ".join(parts)
+
+    @staticmethod
+    def get_entities() -> str:
+        entities = {
+            "auml": "ä",
+            "Auml": "Ä",
+            "euro": "€",
+            "gt": ">",
+            "lt": "<",
+            "nbsp": " ",
+            "ouml": "ö",
+            "Ouml": "Ö",
+            "szlig": "ß",
+            "uuml": "ü",
+            "Üuml": "Ü",
+        }
+        return "".join([f"<!ENTITY {k} \"{v}\">" for k, v in entities.items()])
+
+    def process_confluence_xml(self, xhtml_text: str) -> str:
+        namespace_string = self.get_namespaces()
+        entities = self.get_entities()
+        wrapped = f'<!DOCTYPE ac:root SYSTEM "test" [{entities}]><ac:root {namespace_string}>{xhtml_text}</ac:root>'
+        dom = ET.fromstring(wrapped)
+        result = ET.tostring(dom, pretty_print=True, encoding="UTF-8").decode("utf-8")
+        result = result[(result.find(">") + 1) :]
+        result = result[: result.rfind("<")]
+        return result
+
+
+# -----------------------------------------------------------------------------
+# Config & Utilities
+# -----------------------------------------------------------------------------
+@dataclass
+class SimpleConfiguration:
+    directory_name: str = ".confluence-asciidoctor"
+    configfile_name: str = "config"
+    work_dir: Path = Path.cwd()
+
+    def __post_init__(self) -> None:
+        self.configuration = self._init(self.work_dir)
+
+    def _init(self, work_dir: Path) -> Dict[str, Any]:
+        configuration: Dict[str, Any] = {"work_dir": str(work_dir)}
+        config_dir = self._find_root_init(work_dir, self.directory_name)
+        if config_dir is None:
+            root_dir = work_dir
+            config_dir = work_dir / self.directory_name
+        else:
+            root_dir = config_dir.parent
+        configuration.update(
+            {
+                "root_dir": str(root_dir),
+                "config_dir": str(config_dir),
+                "config_file": str(config_dir / self.configfile_name),
+            }
+        )
+        self.__dict__.update(configuration)
+        return configuration
+
+    @staticmethod
+    def _find_root_init(path: Path, config_dir: str) -> Optional[Path]:
+        p = path
+        while not p.exists():
+            p = p.parent
+        if not p.is_dir():
+            p = p.parent
+        return SimpleConfiguration._find_root(p, config_dir)
+
+    @staticmethod
+    def _find_root(dirpath: Path, config_dir: str) -> Optional[Path]:
+        while dirpath != dirpath.root:
+            target = dirpath / config_dir
+            if target.is_dir():
+                return target
+            dirpath = dirpath.parent
+        return None
+
+
+def get_default_config() -> str:
+    return """
+[default]
+base_url=https://example.com/space
+space_key=EXA
+code_theme=Confluence
+"""
+
+
+def _serialize_config(cp: ConfigParser) -> Dict[str, Dict[str, str]]:
+    result: Dict[str, Dict[str, str]] = {}
+    for section in cp.sections():
+        result[section] = {opt: cp.get(section, opt) for opt in cp.options(section)}
+    return result
+
+
+def get_internal_default_config() -> Dict[str, Dict[str, str]]:
+    cp = ConfigParser(interpolation=ExtendedInterpolation())
+    cp.read_string(get_default_config())
+    return _serialize_config(cp)
+
+
+def merge_dict_deep(target: Mapping[str, Any], source: Mapping[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = dict(target)
+    for k, v in source.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = merge_dict_deep(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Asciidoctor runner
+# -----------------------------------------------------------------------------
+class ShellCmd:
+    def __init__(self) -> None:
+        self.exit_code = 0
+
+    def execute(self, args: List[str]) -> str:
+        proc = subprocess.run(args, capture_output=True, text=True)
+        self.exit_code = proc.returncode
+        if proc.returncode != 0:
+            raise RuntimeError(f"Command failed: {' '.join(args)} {proc.stderr}")
+        return proc.stdout
+
+
+# -----------------------------------------------------------------------------
+# Confluence orchestrator (Bearer token)
+# -----------------------------------------------------------------------------
+class Confluence:
+    def __init__(self, config: Mapping[str, Any], bearer_token: Optional[str]) -> None:
+        self.config = config
+        base_url = config["default"]["base_url"]
+        space_key = config["default"]["space_key"]
+        parsed = urlparse(base_url)
+        self.hostname = parsed.netloc.split(":")[0]
+        self.http = HTTP(bearer_token)
+        self.c = ConfluenceRestAPI(self.http, base_url, space_key)
+        self._ancestor_cache: Dict[str, Optional[str]] = {}
+
+    @staticmethod
+    def filename_to_title(name: Path) -> str:
+        return name.stem or name.name
+
+    @staticmethod
+    def relpath_to_lookup_name(relpath: Path) -> str:
+        return str(relpath)
+
+    @staticmethod
+    def _parse_path(path: str) -> List[str]:
+        result = ""
+        stack: List[str] = []
+        expect_number = False
+        for c in path:
+            if expect_number:
+                if c == ']':
+                    if not result.isdigit():
+                        raise ValueError("expected digit in bracket index")
+                    stack.append(result)
+                    result = ""
+                    expect_number = False
+                    continue
+            else:
+                if c == '[':
+                    stack.append(result)
+                    result = ""
+                    expect_number = True
+                    continue
+                if c == '.':
+                    if result:
+                        stack.append(result)
+                    result = ""
+                    continue
+            result += c
+        stack.append(result)
+        return stack
+
+    def _get_element_by_path(self, path: str, obj: Mapping[str, Any]) -> Any:
+        lookup: Any = obj
+        for element in self._parse_path(path):
+            if element.isdigit():
+                pos = int(element)
+                if pos >= len(lookup):
+                    return None
+                lookup = lookup[pos]
+            else:
+                if isinstance(lookup, Mapping) and element in lookup:
+                    lookup = lookup[element]
+                else:
+                    return None
+        return lookup
+
+    @staticmethod
+    def read_from_asciidoctor(filename: Path) -> str:
+        cmd = ShellCmd()
+        args = ["asciidoctor", "-b", "xhtml5", "-o", "-", str(filename)]
+        return cmd.execute(args)
+
+    def _ancestor_id(self, title: str) -> Optional[str]:
+        json_data = self.c.version(title)
+        return self._get_element_by_path("results[0].id", json_data)
+
+    def _cached_ancestor_id(self, title: Optional[str]) -> Optional[str]:
+        if not title:
+            return None
+        if title in self._ancestor_cache:
+            return self._ancestor_cache[title]
+        ancestor_id = self._ancestor_id(title)
+        self._ancestor_cache[title] = ancestor_id
+        return ancestor_id
+
+    def publish(self, title: str, content: str, ancestor_id: Optional[str]) -> Dict[str, Any]:
+        json_result = self.c.version(title)
+        if not json_result.get("results"):
+            return self.c.create_page(title, content, ancestor_id)
+        page_id = self._get_element_by_path("results[0].id", json_result)
+        version = self._get_element_by_path("results[0].version.number", json_result) or 0
+        return self.c.update_page(page_id, int(version) + 1, title, content, ancestor_id)
+
+    def _file_to_xml(self, filename: Path) -> Tuple[str, List[str]]:
+        fix = ConfluenceFixes(self.config)
+        if filename.suffix == ".xml":
+            xhtml = filename.read_text(encoding="utf-8")
+            xhtml = fix.process_confluence_xml(xhtml)
+        elif filename.suffix == ".txt":
+            xhtml = self.read_from_asciidoctor(filename)
+            xhtml = fix.process_asciidoctor_xml(xhtml)
+        else:
+            raise ValueError(f"Unsupported file type: {filename.suffix}")
+        return xhtml, fix.get_image_src_list()
+
+    def process_file(self, filename: Path, parent_page_title: Optional[str] = None) -> None:
+        if filename.is_dir():
+            log.info("Skipping directory argument: %s", filename)
+            return
+        title = self.filename_to_title(filename)
+        abspath = filename.resolve().parent
+        root_dir = Path(self.config["internal"]["root_dir"])  # type: ignore[index]
+        relpath = Path("") if abspath == root_dir else abspath.relative_to(root_dir)
+        if parent_page_title is None and relpath != Path(""):
+            parent_page_title = os.path.basename(self.relpath_to_lookup_name(relpath))
+        ancestor_id = self._cached_ancestor_id(parent_page_title)
+        xhtml, image_src_list = self._file_to_xml(filename)
+        msg = f"Publishing '{title}' to '{self.hostname}'"
+        if parent_page_title:
+            msg += f" under parent page '{parent_page_title}'"
+        log.info(msg)
+        result = self.publish(title, xhtml, ancestor_id)
+        page_id = result["id"]
+        for img in image_src_list:
+            log.info("  Appending image '%s'", img)
+            self.c.attach_file_to_page(page_id, Path(img), "initial")
+
+    def dump(self, page_name: str) -> None:
+        json_data = self.c.version(page_name)
+        ancestor_id = self._get_element_by_path("results[0].id", json_data)
+        result = self.c.dump(ancestor_id)
+        body = self._get_element_by_path("body.storage.value", result)
+        print(body)
+
+    def dump_xhtml(self, filename: Path) -> None:
+        xhtml = self.read_from_asciidoctor(filename)
+        if not xhtml:
+            return
+        fix = ConfluenceFixes(self.config)
+        xhtml2 = fix.process_asciidoctor_xml(xhtml)
+        print(xhtml2)
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+def parse_cmdline() -> argparse.Namespace:
+    parser = argparse.ArgumentParser("confluence-asciidoctor")
+
+    parser.add_argument("--code-theme", dest="code_theme", help="Confluence code macro theme")
+    parser.add_argument("--token", dest="token", help="Bearer token (or set CONFLUENCE_TOKEN)")
+
+    subparsers = parser.add_subparsers(dest="command", required=True, help="commands")
+
+    # publish
+    p_pub = subparsers.add_parser("publish", aliases=["pu"], help="Publish one or more files")
+    p_pub.add_argument("-p", "--parent-page-title", dest="parent_page_title", help="Parent page title")
+    p_pub.add_argument("file", nargs="+", help=".txt (asciidoctor) or .xml files")
+
+    # download
+    p_dl = subparsers.add_parser("download", aliases=["do"], help="Dump page content")
+    p_dl.add_argument("page_title", help="Page title")
+
+    # dump
+    p_dump = subparsers.add_parser("dump", help="Dump page content (alias of download)")
+    p_dump.add_argument("page_title", help="Page title")
+
+    # dumpxhtml
+    p_dumpx = subparsers.add_parser("dumpxhtml", help="Transform local .txt to Confluence XHTML and print")
+    p_dumpx.add_argument("file", help=".txt file path")
+
+    # init
+    p_init = subparsers.add_parser("init", help="Initialize local config directory")
+    p_init.add_argument("--url", default="http://127.0.0.1/display/EXAMPLE", help="Confluence space URL (…/display/<SPACE>)")
+
+    args = parser.parse_args()
+
+    if args.command == "do":
+        args.command = "download"
+    elif args.command == "pu":
+        args.command = "publish"
+    return args
+
+
+def get_default_config() -> str:
+    return """
+[default]
+base_url=https://example.com/space
+space_key=EXA
+code_theme=Confluence
+"""
+
+
+def _serialize_config(cp: ConfigParser) -> Dict[str, Dict[str, str]]:
+    result: Dict[str, Dict[str, str]] = {}
+    for section in cp.sections():
+        result[section] = {opt: cp.get(section, opt) for opt in cp.options(section)}
+    return result
+
+
+def get_internal_default_config() -> Dict[str, Dict[str, str]]:
+    cp = ConfigParser(interpolation=ExtendedInterpolation())
+    cp.read_string(get_default_config())
+    return _serialize_config(cp)
+
+
+def main() -> None:
+    default_config = get_internal_default_config()
+    simple_config = SimpleConfiguration()
+
+    args = parse_cmdline()
+    if args.code_theme:
+        default_config.setdefault("default", {})["code_theme"] = args.code_theme
+
+    if args.command == "init":
+        config_dir = Path(simple_config.config_dir)
+        config_dir.mkdir(parents=True, exist_ok=True)
+        match = re.match(r"^(.*)?/display/([^/]+)", args.url)
+        if not match:
+            raise ValueError(f"Could not parse URL: {args.url}")
+        base_url, space_key = match.groups()
+        config_file = Path(simple_config.config_file)
+        if not config_file.exists():
+            config_file.write_text(f"[default] base_url={base_url} space_key={space_key} code_theme=Confluence", encoding="utf-8")
+        log.info("Initialized config at %s", config_file)
+        return
+
+    # attach internal paths
+    default_config["internal"] = simple_config.__dict__
+
+    config_path = Path(simple_config.config_file)
+    if not config_path.exists():
+        log.error("No config found. Run: confluence-asciidoctor init --url <URL>")
+        return
+
+    cp = ConfigParser()
+    cp.read(config_path)
+    file_config = _serialize_config(cp)
+    merged_config = merge_dict_deep(default_config, file_config)
+
+    bearer_token = args.token or os.environ.get("CONFLUENCE_TOKEN")
+    if not bearer_token:
+        raise RuntimeError("Missing bearer token. Pass --token or set CONFLUENCE_TOKEN.")
+
+    confluence = Confluence(merged_config, bearer_token)
+
+    if args.command in ("download", "dump"):
+        confluence.dump(args.page_title)
+        return
+
+    if args.command == "dumpxhtml":
+        confluence.dump_xhtml(Path(args.file))
+        return
+
+    if args.command == "publish":
+        for fname in args.file:
+            confluence.process_file(Path(fname), args.parent_page_title)
+        return
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001
+        log.error("%s", exc)
+        raise
