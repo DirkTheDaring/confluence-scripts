@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-Refactored Confluence Asciidoctor publisher (Python 3 only)
-- Removes netrc/Basic Auth; adds Bearer token auth (CLI or env)
-- Adds type hints, logging, and structured errors
-- Uses pathlib for paths and f-strings
-- Skips directories passed as inputs
-- Handles redirects and accepts any 2xx status code
-- Avoids sys.exit() in library code; raises exceptions instead
-
-Auth:
-  * Pass --token "<token>" or set environment variable CONFLUENCE_TOKEN
+Confluence Asciidoctor Publisher (Python 3 only)
+- Bearer token auth (CLI flag or CONFLUENCE_TOKEN)
+- Writes/reads TOML config (config.toml)
+- Paths via pathlib, structured logging, exceptions (no sys.exit in lib code)
+- Skips directory args; accepts any 2xx HTTP; proxy env support
+- Clean CLI: --help does not touch FS; fast-path init avoids crawling
 """
 from __future__ import annotations
 
@@ -21,20 +17,18 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from textwrap import dedent
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import lxml.etree as ET
+import tomllib  # Python ≥3.11
 import urllib3
-from configparser import ConfigParser, ExtendedInterpolation
 from urllib.parse import urlencode, urlparse, unquote
 
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("confluence-asciidoctor")
 
 # -----------------------------------------------------------------------------
@@ -51,7 +45,6 @@ class HTTP:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         proxy_url = self._get_proxy_url()
         self.http = urllib3.ProxyManager(proxy_url) if proxy_url else urllib3.PoolManager()
-        self.bearer_token = bearer_token
         self.base_headers: Dict[str, str] = {"Content-Type": "application/json"}
         if bearer_token:
             self.base_headers["Authorization"] = f"Bearer {bearer_token}"
@@ -59,13 +52,13 @@ class HTTP:
     @staticmethod
     def _get_proxy_url() -> Optional[str]:
         for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
-            value = os.environ.get(name)
-            if value:
-                return value
+            val = os.environ.get(name)
+            if val:
+                return val
         return None
 
     def _merge_headers(self, headers: Optional[Mapping[str, str]]) -> Mapping[str, str]:
-        merged: Dict[str, str] = dict(self.base_headers)
+        merged = dict(self.base_headers)
         if headers:
             merged.update(headers)
         return merged
@@ -77,25 +70,20 @@ class HTTP:
         return response.data.decode("utf-8", "strict")
 
     def GET(self, url: str, headers: Optional[Mapping[str, str]] = None) -> str:
-        resp = self.http.request("GET", url, headers=self._merge_headers(headers))
-        return self._handle_response(resp)
+        r = self.http.request("GET", url, headers=self._merge_headers(headers))
+        return self._handle_response(r)
 
     def POST(self, url: str, data: str, headers: Optional[Mapping[str, str]] = None) -> str:
-        resp = self.http.request("POST", url, headers=self._merge_headers(headers), body=data)
-        return self._handle_response(resp)
+        r = self.http.request("POST", url, headers=self._merge_headers(headers), body=data)
+        return self._handle_response(r)
 
     def PUT(self, url: str, data: str, headers: Optional[Mapping[str, str]] = None) -> str:
-        resp = self.http.request("PUT", url, headers=self._merge_headers(headers), body=data)
-        return self._handle_response(resp)
+        r = self.http.request("PUT", url, headers=self._merge_headers(headers), body=data)
+        return self._handle_response(r)
 
-    def POST_MULTIPART(
-        self,
-        url: str,
-        headers: Optional[Mapping[str, str]],
-        fields: Mapping[str, Any],
-    ) -> str:
-        resp = self.http.request("POST", url, headers=self._merge_headers(headers), fields=fields)
-        return self._handle_response(resp)
+    def POST_MULTIPART(self, url: str, headers: Optional[Mapping[str, str]], fields: Mapping[str, Any]) -> str:
+        r = self.http.request("POST", url, headers=self._merge_headers(headers), fields=fields)
+        return self._handle_response(r)
 
     def POST_FILE(
         self,
@@ -106,13 +94,11 @@ class HTTP:
         field_name: str,
         filename: Optional[str] = None,
     ) -> str:
-        if filename is None:
-            filename = filepath.name
+        filename = filename or filepath.name
         data = filepath.read_bytes()
-        file_tuple = (filename, data)
-        fields = dict(fields)
-        fields[field_name] = file_tuple
-        return self.POST_MULTIPART(url, headers=headers, fields=fields)
+        payload = dict(fields)
+        payload[field_name] = (filename, data)
+        return self.POST_MULTIPART(url, headers=headers, fields=payload)
 
 
 # -----------------------------------------------------------------------------
@@ -216,7 +202,7 @@ class ConfluenceRestAPI:
 
 
 # -----------------------------------------------------------------------------
-# Confluence XHTML/XSLT fixes (unchanged from previous refactor)
+# Confluence XHTML/XSLT fixes
 # -----------------------------------------------------------------------------
 class ConfluenceFixes:
     def __init__(self, config: Mapping[str, Mapping[str, str]]):
@@ -230,7 +216,7 @@ class ConfluenceFixes:
         self.config = config
 
     @staticmethod
-    def extract_content_div_xsl() -> str:
+    def _xsl_extract_content_div() -> str:
         return '''<xsl:stylesheet
             version="1.0"
             xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
@@ -241,28 +227,26 @@ class ConfluenceFixes:
             >
             <xsl:output indent="yes" method="xml" omit-xml-declaration="yes"  />
             <xsl:template match="/">
-                    <div>
+                <div>
                     <xsl:apply-templates select="x:html/x:body/x:div[@id='content']/x:*"/>
-                    </div>
+                </div>
             </xsl:template>
             <xsl:template match="@*|node()">
-            <xsl:copy>
-                <xsl:apply-templates select="@*|node()"/>
-            </xsl:copy>
+                <xsl:copy>
+                    <xsl:apply-templates select="@*|node()"/>
+                </xsl:copy>
             </xsl:template>
             <xsl:template match="x:*">
-                    <xsl:element name="{local-name()}">
-                            <xsl:copy-of select="namespace::*[not(. = namespace-uri(..))]"/>
-                            <xsl:apply-templates select="@*|node()"/>
-                    </xsl:element>
+                <xsl:element name="{local-name()}">
+                    <xsl:copy-of select="namespace::*[not(. = namespace-uri(..))]"/>
+                    <xsl:apply-templates select="@*|node()"/>
+                </xsl:element>
             </xsl:template>
-</xsl:stylesheet>
-'''
+</xsl:stylesheet>'''
 
     @staticmethod
-    def transform_code_section_xsl() -> str:
-        return '''
-<xsl:stylesheet
+    def _xsl_transform_code() -> str:
+        return '''<xsl:stylesheet
             version="1.0"
             xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
             xmlns:x="http://www.w3.org/1999/xhtml"
@@ -270,69 +254,58 @@ class ConfluenceFixes:
             xmlns:ri="http://www.atlassian.com/schema/confluence/4/ri/"
             exclude-result-prefixes="x"
             >
-            <xsl:output indent="yes" method="xml" omit-xml-declaration="yes"  cdata-section-elements="ac:plain-text-body"  />
-    <xsl:template match="node()|@*">
-        <xsl:copy>
-            <xsl:apply-templates select="node()|@*"/>
-            </xsl:copy>
-    </xsl:template>
-    <xsl:template match="//div[div[@class='content']/pre[@class='highlight'] ]" >
-        <ac:structured-macro ac:name="code" ac:schema-version="1" ac:macro-id="bcb394c5-e0b8-4630-9e1a-1c3a48076738">
-            <ac:parameter ac:name="language"><xsl:value-of select="div/pre/code/@data-lang" /></ac:parameter>
-            <ac:parameter ac:name="theme"><xsl:copy-of select="$theme"/></ac:parameter>
-            <ac:parameter ac:name="title"><xsl:copy-of select="$title"/></ac:parameter>
-            <ac:plain-text-body><xsl:value-of select="div/pre/code" /></ac:plain-text-body>
-        </ac:structured-macro>
+            <xsl:output indent="yes" method="xml" omit-xml-declaration="yes" cdata-section-elements="ac:plain-text-body" />
+            <xsl:template match="node()|@*">
+                <xsl:copy><xsl:apply-templates select="node()|@*"/></xsl:copy>
             </xsl:template>
-</xsl:stylesheet>
-'''
+            <xsl:template match="//div[div[@class='content']/pre[@class='highlight'] ]">
+                <ac:structured-macro ac:name="code" ac:schema-version="1" ac:macro-id="bcb394c5-e0b8-4630-9e1a-1c3a48076738">
+                    <ac:parameter ac:name="language"><xsl:value-of select="div/pre/code/@data-lang"/></ac:parameter>
+                    <ac:parameter ac:name="theme"><xsl:copy-of select="$theme"/></ac:parameter>
+                    <ac:parameter ac:name="title"><xsl:copy-of select="$title"/></ac:parameter>
+                    <ac:plain-text-body><xsl:value-of select="div/pre/code"/></ac:plain-text-body>
+                </ac:structured-macro>
+            </xsl:template>
+</xsl:stylesheet>'''
 
     @staticmethod
-    def transform_table_xsl() -> str:
-        return '''
-<xsl:stylesheet
+    def _xsl_transform_table() -> str:
+        return '''<xsl:stylesheet
             version="1.0"
             xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
             xmlns:x="http://www.w3.org/1999/xhtml"
             xmlns:ac="http://www.atlassian.com/schema/confluence/4/ac/"
             exclude-result-prefixes="x"
             >
-    <xsl:output indent="yes" method="xml" omit-xml-declaration="yes"  cdata-section-elements="ac:plain-text-body"  />
-    <xsl:template match="node()|@*">
-        <xsl:copy>
-            <xsl:apply-templates select="node()|@*"/>
-            </xsl:copy>
-    </xsl:template>
-    <xsl:template match="x:table">
-        <xsl:element name="table" namespace="http://www.w3.org/1999/xhtml"  >
-            <xsl:attribute name="class">fixed-table wrapped</xsl:attribute>
-        <xsl:element name="colgroup" namespace="http://www.w3.org/1999/xhtml" >
-            <xsl:copy-of select="./x:colgroup/x:col"/>
-        </xsl:element>
-        <xsl:element name="tbody" namespace="http://www.w3.org/1999/xhtml" >
-            <xsl:for-each select="./x:thead/x:tr">
-                <xsl:element name="tr" namespace="http://www.w3.org/1999/xhtml" >
-                    <xsl:for-each select="./x:th">
-                    <xsl:element name="th" namespace="http://www.w3.org/1999/xhtml" >
-                            <xsl:copy-of select="node()"/>
+            <xsl:output indent="yes" method="xml" omit-xml-declaration="yes" />
+            <xsl:template match="node()|@*">
+                <xsl:copy><xsl:apply-templates select="node()|@*"/></xsl:copy>
+            </xsl:template>
+            <xsl:template match="x:table">
+                <xsl:element name="table" namespace="http://www.w3.org/1999/xhtml">
+                    <xsl:attribute name="class">fixed-table wrapped</xsl:attribute>
+                    <xsl:element name="colgroup" namespace="http://www.w3.org/1999/xhtml">
+                        <xsl:copy-of select="./x:colgroup/x:col"/>
                     </xsl:element>
-                    </xsl:for-each>
-                </xsl:element>
-            </xsl:for-each>
-            <xsl:for-each select="./x:tbody/x:tr">
-                <xsl:element name="tr" namespace="http://www.w3.org/1999/xhtml" >
-                    <xsl:for-each select="./x:td/x:p">
-                    <xsl:element name="td" namespace="http://www.w3.org/1999/xhtml" >
-                            <xsl:copy-of select="node()"/>
+                    <xsl:element name="tbody" namespace="http://www.w3.org/1999/xhtml">
+                        <xsl:for-each select="./x:thead/x:tr">
+                            <xsl:element name="tr" namespace="http://www.w3.org/1999/xhtml">
+                                <xsl:for-each select="./x:th">
+                                    <xsl:element name="th" namespace="http://www.w3.org/1999/xhtml"><xsl:copy-of select="node()"/></xsl:element>
+                                </xsl:for-each>
+                            </xsl:element>
+                        </xsl:for-each>
+                        <xsl:for-each select="./x:tbody/x:tr">
+                            <xsl:element name="tr" namespace="http://www.w3.org/1999/xhtml">
+                                <xsl:for-each select="./x:td/x:p">
+                                    <xsl:element name="td" namespace="http://www.w3.org/1999/xhtml"><xsl:copy-of select="node()"/></xsl:element>
+                                </xsl:for-each>
+                            </xsl:element>
+                        </xsl:for-each>
                     </xsl:element>
-                    </xsl:for-each>
                 </xsl:element>
-            </xsl:for-each>
-        </xsl:element>
-        </xsl:element>
-    </xsl:template>
-</xsl:stylesheet>
-'''
+            </xsl:template>
+</xsl:stylesheet>'''
 
     def _transform(self, dom: ET._Element, xslt_text: str, **params: Any) -> ET._Element:
         xslt = ET.XML(xslt_text)
@@ -341,12 +314,12 @@ class ConfluenceFixes:
         return newdom  # type: ignore[return-value]
 
     def transform_table(self, dom: ET._Element) -> ET._Element:
-        return self._transform(dom, self.transform_table_xsl())
+        return self._transform(dom, self._xsl_transform_table())
 
     def transform_code_section(self, dom: ET._Element) -> ET._Element:
         theme = self.config["default"]["code_theme"]
         title = ""
-        newdom = self._transform(dom, self.transform_code_section_xsl(), theme=theme, title=title)
+        newdom = self._transform(dom, self._xsl_transform_code(), theme=theme, title=title)
         elements = newdom.xpath("//ac:parameter[@ac:name='language']", namespaces=self.namespaces)
         for element in elements:
             value = (element.text or "").lower()
@@ -358,47 +331,31 @@ class ConfluenceFixes:
         return newdom
 
     def extract_content(self, dom: ET._Element) -> ET._Element:
-        return self._transform(dom, self.extract_content_div_xsl())
+        return self._transform(dom, self._xsl_extract_content_div())
 
     def create_standard_attachment(self, filename: str) -> ET._Element:
-        new_ac_element = ET.Element("{http://www.atlassian.com/schema/confluence/4/ac/}image", nsmap=self.namespaces)
-        ET.SubElement(
-            new_ac_element,
-            "{http://www.atlassian.com/schema/confluence/4/ri/}attachment",
-            {"{http://www.atlassian.com/schema/confluence/4/ri/}filename": filename},
-            nsmap=self.namespaces,
-        )
-        return new_ac_element
+        new_ac = ET.Element("{http://www.atlassian.com/schema/confluence/4/ac/}image", nsmap=self.namespaces)
+        ET.SubElement(new_ac, "{http://www.atlassian.com/schema/confluence/4/ri/}attachment", {
+            "{http://www.atlassian.com/schema/confluence/4/ri/}filename": filename
+        }, nsmap=self.namespaces)
+        return new_ac
 
     def create_macro_attachment(self, filename: str, height: str = "250") -> ET._Element:
-        new_ac_element = ET.Element(
-            "{http://www.atlassian.com/schema/confluence/4/ac/}structured-macro",
-            {
-                "{http://www.atlassian.com/schema/confluence/4/ac/}name": "view-file",
-                "{http://www.atlassian.com/schema/confluence/4/ac/}schema-version": "1",
-            },
-            nsmap=self.namespaces,
-        )
-        param = ET.SubElement(
-            new_ac_element,
-            "{http://www.atlassian.com/schema/confluence/4/ac/}parameter",
-            {"{http://www.atlassian.com/schema/confluence/4/ac/}name": "name"},
-            nsmap=self.namespaces,
-        )
-        ET.SubElement(
-            param,
-            "{http://www.atlassian.com/schema/confluence/4/ri/}attachment",
-            {"{http://www.atlassian.com/schema/confluence/4/ri/}filename": filename},
-            nsmap=self.namespaces,
-        )
-        param2 = ET.SubElement(
-            new_ac_element,
-            "{http://www.atlassian.com/schema/confluence/4/ac/}parameter",
-            {"{http://www.atlassian.com/schema/confluence/4/ac/}name": "height"},
-            nsmap=self.namespaces,
-        )
-        param2.text = height
-        return new_ac_element
+        new_ac = ET.Element("{http://www.atlassian.com/schema/confluence/4/ac/}structured-macro", {
+            "{http://www.atlassian.com/schema/confluence/4/ac/}name": "view-file",
+            "{http://www.atlassian.com/schema/confluence/4/ac/}schema-version": "1",
+        }, nsmap=self.namespaces)
+        p1 = ET.SubElement(new_ac, "{http://www.atlassian.com/schema/confluence/4/ac/}parameter", {
+            "{http://www.atlassian.com/schema/confluence/4/ac/}name": "name"
+        }, nsmap=self.namespaces)
+        ET.SubElement(p1, "{http://www.atlassian.com/schema/confluence/4/ri/}attachment", {
+            "{http://www.atlassian.com/schema/confluence/4/ri/}filename": filename
+        }, nsmap=self.namespaces)
+        p2 = ET.SubElement(new_ac, "{http://www.atlassian.com/schema/confluence/4/ac/}parameter", {
+            "{http://www.atlassian.com/schema/confluence/4/ac/}name": "height"
+        }, nsmap=self.namespaces)
+        p2.text = height
+        return new_ac
 
     def _img_query(self, dom: ET._Element) -> List[ET._Element]:
         return dom.xpath("/xhtml:html/xhtml:body//xhtml:img", namespaces=self.namespaces)
@@ -410,14 +367,14 @@ class ConfluenceFixes:
             if not parent:
                 continue
             if src.suffix in {".pptx", ".pdf"}:
-                new_ac_element = self.create_macro_attachment(src.name)
+                new_ac = self.create_macro_attachment(src.name)
             else:
-                new_ac_element = self.create_standard_attachment(src.name)
-            parent.replace(img, new_ac_element)
+                new_ac = self.create_standard_attachment(src.name)
+            parent.replace(img, new_ac)
 
     def _extract_img_sources(self, dom: ET._Element) -> None:
-        image_src_list = dom.xpath("/xhtml:html/xhtml:body//xhtml:img/@src", namespaces=self.namespaces)
-        self.image_src_list = [unquote(s) for s in image_src_list]
+        paths = dom.xpath("/xhtml:html/xhtml:body//xhtml:img/@src", namespaces=self.namespaces)
+        self.image_src_list = [unquote(s) for s in paths]
 
     def _extract_a_sources(self, dom: ET._Element) -> None:
         self.a_href_list = dom.xpath("/xhtml:html/xhtml:body//xhtml:a/@href", namespaces=self.namespaces)
@@ -447,8 +404,7 @@ class ConfluenceFixes:
             "ac": "http://www.atlassian.com/schema/confluence/4/ac/",
             "ri": "http://www.atlassian.com/schema/confluence/4/ri/",
         }
-        parts = [f"xmlns:{k}=\"{v}\"" for k, v in xmlns.items()]
-        return " ".join(parts)
+        return " ".join([f"xmlns:{k}=\"{v}\"" for k, v in xmlns.items()])
 
     @staticmethod
     def get_entities() -> str:
@@ -484,7 +440,7 @@ class ConfluenceFixes:
 @dataclass
 class SimpleConfiguration:
     directory_name: str = ".confluence-asciidoctor"
-    configfile_name: str = "config"
+    configfile_name: str = "config.toml"
     work_dir: Path = Path.cwd()
 
     def __post_init__(self) -> None:
@@ -498,13 +454,11 @@ class SimpleConfiguration:
             config_dir = work_dir / self.directory_name
         else:
             root_dir = config_dir.parent
-        configuration.update(
-            {
-                "root_dir": str(root_dir),
-                "config_dir": str(config_dir),
-                "config_file": str(config_dir / self.configfile_name),
-            }
-        )
+        configuration.update({
+            "root_dir": str(root_dir),
+            "config_dir": str(config_dir),
+            "config_file": str(config_dir / self.configfile_name),
+        })
         self.__dict__.update(configuration)
         return configuration
 
@@ -527,26 +481,14 @@ class SimpleConfiguration:
         return None
 
 
-def get_default_config() -> str:
-    return """
-[default]
-base_url=https://example.com/space
-space_key=EXA
-code_theme=Confluence
-"""
-
-
-def _serialize_config(cp: ConfigParser) -> Dict[str, Dict[str, str]]:
-    result: Dict[str, Dict[str, str]] = {}
-    for section in cp.sections():
-        result[section] = {opt: cp.get(section, opt) for opt in cp.options(section)}
-    return result
-
-
 def get_internal_default_config() -> Dict[str, Dict[str, str]]:
-    cp = ConfigParser(interpolation=ExtendedInterpolation())
-    cp.read_string(get_default_config())
-    return _serialize_config(cp)
+    return {
+        "default": {
+            "base_url": "https://example.com/space",
+            "space_key": "EXA",
+            "code_theme": "Confluence",
+        }
+    }
 
 
 def merge_dict_deep(target: Mapping[str, Any], source: Mapping[str, Any]) -> Dict[str, Any]:
@@ -727,39 +669,32 @@ def parse_cmdline() -> argparse.Namespace:
     parser.add_argument("--code-theme", dest="code_theme", help="Confluence code macro theme")
     parser.add_argument("--token", dest="token", help="Bearer token (or set CONFLUENCE_TOKEN)")
 
-    # NOTE: do NOT require a subcommand so --help prints top-level help
+    # Do not require subcommand so --help works without FS access
     subparsers = parser.add_subparsers(dest="command", help="commands")
 
-    # publish
     p_pub = subparsers.add_parser("publish", aliases=["pu"], help="Publish one or more files")
     p_pub.add_argument("-p", "--parent-page-title", dest="parent_page_title", help="Parent page title")
     p_pub.add_argument("file", nargs="+", help=".txt (asciidoctor) or .xml files")
 
-    # download
     p_dl = subparsers.add_parser("download", aliases=["do"], help="Dump page content")
     p_dl.add_argument("page_title", help="Page title")
 
-    # dump
     p_dump = subparsers.add_parser("dump", help="Dump page content (alias of download)")
     p_dump.add_argument("page_title", help="Page title")
 
-    # dumpxhtml
     p_dumpx = subparsers.add_parser("dumpxhtml", help="Transform local .txt to Confluence XHTML and print")
     p_dumpx.add_argument("file", help=".txt file path")
 
-    # init
     p_init = subparsers.add_parser("init", help="Initialize local config directory")
     p_init.add_argument("--url", default="http://127.0.0.1/display/EXAMPLE", help="Confluence space URL (…/display/<SPACE>)")
 
     args = parser.parse_args()
 
-    # normalize aliases
     if args.command == "do":
         args.command = "download"
     elif args.command == "pu":
         args.command = "publish"
 
-    # If no subcommand given, show help
     if args.command is None:
         parser.print_help()
 
@@ -768,13 +703,11 @@ def parse_cmdline() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_cmdline()
-    # If no subcommand (e.g., user ran only --help), exit early before any FS work
     if getattr(args, "command", None) is None:
         return
 
-    # Fast path for `init`: avoid any directory crawl before we know where to write
+    # Fast path for init: no FS crawl
     if args.command == "init":
-        # initialize in current working directory
         cwd = Path.cwd()
         config_dir = cwd / ".confluence-asciidoctor"
         config_dir.mkdir(parents=True, exist_ok=True)
@@ -784,21 +717,25 @@ def main() -> None:
             raise ValueError(f"Could not parse URL: {args.url}")
         base_url, space_key = match.groups()
 
-        config_file = config_dir / "config"
+        config_file = config_dir / "config.toml"
         if not config_file.exists():
-            config_file.write_text(
-                f"[default] base_url={base_url} space_key={space_key} code_theme=Confluence ", encoding="utf-8")
+            toml_text = dedent(f"""
+            [default]
+            base_url = "{base_url}"
+            space_key = "{space_key}"
+            code_theme = "Confluence"
+            """).lstrip()
+            config_file.write_text(toml_text, encoding="utf-8")
         log.info("Initialized config at %s", config_file)
         return
 
-    # For all other commands, proceed with full configuration discovery
+    # For other commands
     default_config = get_internal_default_config()
     simple_config = SimpleConfiguration()
 
     if args.code_theme:
         default_config.setdefault("default", {})["code_theme"] = args.code_theme
 
-    # attach internal paths
     default_config["internal"] = simple_config.__dict__
 
     config_path = Path(simple_config.config_file)
@@ -806,9 +743,9 @@ def main() -> None:
         log.error("No config found. Run: confluence-asciidoctor init --url <URL>")
         return
 
-    cp = ConfigParser()
-    cp.read(config_path)
-    file_config = _serialize_config(cp)
+    with open(config_path, "rb") as fh:
+        file_config = tomllib.load(fh)
+
     merged_config = merge_dict_deep(default_config, file_config)
 
     bearer_token = args.token or os.environ.get("CONFLUENCE_TOKEN")
@@ -820,11 +757,9 @@ def main() -> None:
     if args.command in ("download", "dump"):
         confluence.dump(args.page_title)
         return
-
     if args.command == "dumpxhtml":
         confluence.dump_xhtml(Path(args.file))
         return
-
     if args.command == "publish":
         for fname in args.file:
             confluence.process_file(Path(fname), args.parent_page_title)
@@ -834,6 +769,6 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # surface errors for visibility
         log.error("%s", exc)
         raise
