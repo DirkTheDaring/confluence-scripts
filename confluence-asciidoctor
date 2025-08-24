@@ -583,6 +583,24 @@ class Confluence:
         return lookup
 
     @staticmethod
+    def _extract_id_or_title_from_url(value: str) -> Tuple[Optional[str], Optional[str]]:
+        """Return (page_id, title_from_url) for a Confluence page URL.
+        Supports paths like /spaces/<KEY>/pages/<ID>/<Title> and /pages/<ID>/...
+        """
+        try:
+            u = urlparse(value)
+            path = u.path
+            m = re.search(r"/pages/(\\d+)", path)
+            if m:
+                return m.group(1), None
+            # Fallback: decode trailing path segment into a title
+            segment = Path(unquote(path.rstrip('/').split('/')[-1])).name
+            title = segment.replace('+', ' ').strip() if segment else None
+            return None, title or None
+        except Exception:
+            return None, None
+
+    @staticmethod
     def read_from_asciidoctor(filename: Path) -> str:
         cmd = ShellCmd()
         args = ["asciidoctor", "-b", "xhtml5", "-o", "-", str(filename)]
@@ -625,26 +643,57 @@ class Confluence:
         if filename.is_dir():
             log.info("Skipping directory argument: %s", filename)
             return
+
         title = self.filename_to_title(filename)
         abspath = filename.resolve().parent
         root_dir = Path(self.config["internal"]["root_dir"])  # type: ignore[index]
         relpath = Path("") if abspath == root_dir else abspath.relative_to(root_dir)
-        if parent_page_title is None and relpath != Path(""):
-            parent_page_title = os.path.basename(self.relpath_to_lookup_name(relpath))
-        ancestor_id = self._cached_ancestor_id(parent_page_title)
+
+        # Determine ancestor_id: accept URL or plain title for
+        # -p/--parent-page-title
+        ancestor_id: Optional[str] = None
+        if parent_page_title:
+            if parent_page_title.startswith("http://") or parent_page_title.startswith("https://"):
+                page_id, trailing_title = self._extract_id_or_title_from_url(parent_page_title)
+                if page_id:
+                    ancestor_id = page_id
+                elif trailing_title:
+                    ancestor_id = self._cached_ancestor_id(trailing_title)
+            else:
+                ancestor_id = self._cached_ancestor_id(parent_page_title)
+        elif relpath != Path(""):
+            derived_parent = os.path.basename(self.relpath_to_lookup_name(relpath))
+            ancestor_id = self._cached_ancestor_id(derived_parent)
+
         xhtml, image_src_list = self._file_to_xml(filename)
         msg = f"Publishing '{title}' to '{self.hostname}'"
-        if parent_page_title:
-            msg += f" under parent page '{parent_page_title}'"
+        if ancestor_id:
+            msg += f" under parent page-id '{ancestor_id}'"
+        elif parent_page_title:
+            msg += f" under parent title '{parent_page_title}'"
         log.info(msg)
+
         result = self.publish(title, xhtml, ancestor_id)
         page_id = result["id"]
+
         for img in image_src_list:
             log.info("  Appending image '%s'", img)
             self.c.attach_file_to_page(page_id, Path(img), "initial")
 
-    def dump(self, page_name: str) -> None:
-        json_data = self.c.version(page_name)
+    def dump(self, page_name_or_url: str) -> None:
+        # Accept a page title OR a full URL. Prefer numeric pageId when
+        # present.
+        if page_name_or_url.startswith("http://") or page_name_or_url.startswith("https://"):
+            page_id, trailing_title = self._extract_id_or_title_from_url(page_name_or_url)
+            if page_id:
+                result = self.c.dump(page_id)
+                body = self._get_element_by_path("body.storage.value", result)
+                print(body)
+                return
+            if trailing_title:
+                page_name_or_url = trailing_title
+        # Fallback: title lookup in current space
+        json_data = self.c.version(page_name_or_url)
         ancestor_id = self._get_element_by_path("results[0].id", json_data)
         result = self.c.dump(ancestor_id)
         body = self._get_element_by_path("body.storage.value", result)
@@ -673,14 +722,15 @@ def parse_cmdline() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", help="commands")
 
     p_pub = subparsers.add_parser("publish", aliases=["pu"], help="Publish one or more files")
-    p_pub.add_argument("-p", "--parent-page-title", dest="parent_page_title", help="Parent page title")
+    p_pub.add_argument("-p", "--parent-page-title", dest="parent_page_title",
+                   help="Parent page: title OR full URL")
     p_pub.add_argument("file", nargs="+", help=".txt (asciidoctor) or .xml files")
 
     p_dl = subparsers.add_parser("download", aliases=["do"], help="Dump page content")
-    p_dl.add_argument("page_title", help="Page title")
+    p_dl.add_argument("page_title", help="Page title OR full page URL")
 
     p_dump = subparsers.add_parser("dump", help="Dump page content (alias of download)")
-    p_dump.add_argument("page_title", help="Page title")
+    p_dump.add_argument("page_title", help="Page title OR full page URL")
 
     p_dumpx = subparsers.add_parser("dumpxhtml", help="Transform local .txt to Confluence XHTML and print")
     p_dumpx.add_argument("file", help=".txt file path")
