@@ -727,7 +727,8 @@ def parse_cmdline() -> argparse.Namespace:
     parser.add_argument("--code-theme", dest="code_theme", help="Confluence code macro theme")
     parser.add_argument("--token", dest="token", help="Bearer token (or set CONFLUENCE_TOKEN)")
 
-    subparsers = parser.add_subparsers(dest="command", required=True, help="commands")
+    # NOTE: do NOT require a subcommand so --help prints top-level help
+    subparsers = parser.add_subparsers(dest="command", help="commands")
 
     # publish
     p_pub = subparsers.add_parser("publish", aliases=["pu"], help="Publish one or more files")
@@ -752,40 +753,28 @@ def parse_cmdline() -> argparse.Namespace:
 
     args = parser.parse_args()
 
+    # normalize aliases
     if args.command == "do":
         args.command = "download"
     elif args.command == "pu":
         args.command = "publish"
+
+    # If no subcommand given, show help
+    if args.command is None:
+        parser.print_help()
+
     return args
 
 
-def get_default_config() -> str:
-    return """
-[default]
-base_url=https://example.com/space
-space_key=EXA
-code_theme=Confluence
-"""
-
-
-def _serialize_config(cp: ConfigParser) -> Dict[str, Dict[str, str]]:
-    result: Dict[str, Dict[str, str]] = {}
-    for section in cp.sections():
-        result[section] = {opt: cp.get(section, opt) for opt in cp.options(section)}
-    return result
-
-
-def get_internal_default_config() -> Dict[str, Dict[str, str]]:
-    cp = ConfigParser(interpolation=ExtendedInterpolation())
-    cp.read_string(get_default_config())
-    return _serialize_config(cp)
-
-
 def main() -> None:
-    default_config = get_internal_default_config()
-    simple_config = SimpleConfiguration()
-
     args = parse_cmdline()
+    # If no subcommand (e.g., user ran only --help), exit early before any FS work
+    if getattr(args, "command", None) is None:
+        return
+
+    default_config = get_internal_default_config()
+    # Delay filesystem discovery until we know we actually need it
+    simple_config = SimpleConfiguration()
     if args.code_theme:
         default_config.setdefault("default", {})["code_theme"] = args.code_theme
 
@@ -798,7 +787,8 @@ def main() -> None:
         base_url, space_key = match.groups()
         config_file = Path(simple_config.config_file)
         if not config_file.exists():
-            config_file.write_text(f"[default] base_url={base_url} space_key={space_key} code_theme=Confluence", encoding="utf-8")
+            config_file.write_text(
+                f"[default] base_url={base_url} space_key={space_key} code_theme=Confluence ", encoding="utf-8")
         log.info("Initialized config at %s", config_file)
         return
 
@@ -814,6 +804,10 @@ def main() -> None:
     cp.read(config_path)
     file_config = _serialize_config(cp)
     merged_config = merge_dict_deep(default_config, file_config)
+
+    # if no command (e.g., just --help), stop here after printing help
+    if args.command is None:
+        return
 
     bearer_token = args.token or os.environ.get("CONFLUENCE_TOKEN")
     if not bearer_token:
