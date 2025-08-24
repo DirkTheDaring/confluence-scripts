@@ -772,25 +772,31 @@ def main() -> None:
     if getattr(args, "command", None) is None:
         return
 
-    default_config = get_internal_default_config()
-    # Delay filesystem discovery until we know we actually need it
-    simple_config = SimpleConfiguration()
-    if args.code_theme:
-        default_config.setdefault("default", {})["code_theme"] = args.code_theme
-
+    # Fast path for `init`: avoid any directory crawl before we know where to write
     if args.command == "init":
-        config_dir = Path(simple_config.config_dir)
+        # initialize in current working directory
+        cwd = Path.cwd()
+        config_dir = cwd / ".confluence-asciidoctor"
         config_dir.mkdir(parents=True, exist_ok=True)
+
         match = re.match(r"^(.*)?/display/([^/]+)", args.url)
         if not match:
             raise ValueError(f"Could not parse URL: {args.url}")
         base_url, space_key = match.groups()
-        config_file = Path(simple_config.config_file)
+
+        config_file = config_dir / "config"
         if not config_file.exists():
             config_file.write_text(
                 f"[default] base_url={base_url} space_key={space_key} code_theme=Confluence ", encoding="utf-8")
         log.info("Initialized config at %s", config_file)
         return
+
+    # For all other commands, proceed with full configuration discovery
+    default_config = get_internal_default_config()
+    simple_config = SimpleConfiguration()
+
+    if args.code_theme:
+        default_config.setdefault("default", {})["code_theme"] = args.code_theme
 
     # attach internal paths
     default_config["internal"] = simple_config.__dict__
@@ -804,10 +810,6 @@ def main() -> None:
     cp.read(config_path)
     file_config = _serialize_config(cp)
     merged_config = merge_dict_deep(default_config, file_config)
-
-    # if no command (e.g., just --help), stop here after printing help
-    if args.command is None:
-        return
 
     bearer_token = args.token or os.environ.get("CONFLUENCE_TOKEN")
     if not bearer_token:
