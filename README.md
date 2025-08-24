@@ -8,7 +8,6 @@ Authentication is via **Bearer token**.
 
 - Publish `.txt` files written in **AsciiDoc** (converted via `asciidoctor` to XHTML)
 - Publish `.xml` files (Confluence storage format, pre-processed for safety)
-- Publish `.confluence` files (uploaded **raw** without processing, if enabled)
 - Download existing Confluence pages (`dump` / `download`)
 - Attach images referenced in your documents
 - Initialize a local `.confluence-asciidoctor/config.toml` config
@@ -79,7 +78,6 @@ Publish multiple files at once:
 Rules:
 - `.txt` → processed with Asciidoctor → Confluence XHTML
 - `.xml` → parsed/normalized as Confluence storage format
-- `.confluence` → uploaded raw, no processing (optional mode)
 - Directories passed as arguments are skipped
 
 ### 4. Download Pages
